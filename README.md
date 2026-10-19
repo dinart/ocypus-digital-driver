@@ -10,15 +10,11 @@ A lightweight, clean, and 100% open-source Windows driver for **Ocypus Digital**
 
 ## Why This Project Exists
 
-Ocypus coolers use an internal USB header to update their digital LED/LCD temperature displays. 
+Ocypus coolers use an internal USB header to update their digital LED/LCD temperature displays.
 
-1. **Safety & Privacy:** The official proprietary Windows software is closed-source and distributed by unknown third-party vendors.
-2. **Linux Port Incompatibility:** Existing Linux drivers (`ocypus-control.py`) fail on Windows because:
-   * Windows splits the cooler's USB composite interface (`VID_1A2C & PID_434D`) into 7 separate HID collections (`COL01` to `COL07`). The LCD display is located exclusively on **Collection 7** (`UsagePage=0xFF01`, `Usage=0x0001`). Generic HID enumeration attaches to `COL01`, silently dropping packets.
-   * The protocol payload required a specific 65-byte Feature Report with opcode headers (`0x07, 0xFF, [Unit], [Hundreds], [Tens], [Units]...`).
-   * Linux `k10temp` sensors do not exist on Windows. AMD Ryzen CPUs require low-level MSR/SMU access.
-
-This project solves all these problems natively and cleanly on Windows.
+* **Safety & Transparency:** The official vendor software is closed-source and proprietary, requiring users to install unaudited third-party binaries on their systems.
+* **No Windows Alternative:** Existing open-source scripts were developed exclusively for Linux and do not work out of the box on Windows.
+* **Lightweight & Clean:** Provides a transparent, low-overhead solution that runs quietly without bloat or heavy background suites.
 
 ---
 
