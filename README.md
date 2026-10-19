@@ -148,8 +148,9 @@ python ocypus_driver.py uninstall-startup
 | `python ocypus_driver.py start` | Starts the driver silently in background using `pythonw.exe` |
 | `python ocypus_driver.py stop` | Stops the background driver and blanks the screen |
 | `python ocypus_driver.py status` | Checks if the background driver is active (displays PID) |
-| `python ocypus_driver.py install-startup` | Registers silent auto-start in Windows Task Scheduler |
-| `python ocypus_driver.py uninstall-startup` | Unregisters the auto-start task |
+| `python ocypus_driver.py install-startup` | Registers silent auto-start on Windows login and disables USB Selective Suspend |
+| `python ocypus_driver.py uninstall-startup` | Unregisters the auto-start entry |
+| `python ocypus_driver.py reset-usb` | Resets the cooler's USB port if the hardware endpoint stalls (Win32 Error 31) |
 | `python ocypus_driver.py list` | Lists all detected HID collections and active sensors |
 | `python ocypus_driver.py on` | Runs in foreground with real-time console telemetry |
 | `python ocypus_driver.py off` | Blanks the cooler screen |

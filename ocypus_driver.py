@@ -204,27 +204,68 @@ class OcypusController:
         return results
 
     def open(self) -> bool:
-        """Opens specifically the LCD display collection (UsagePage=0xFF01, Usage=0x0001)."""
-        for col in self.list_collections():
-            if (
-                col["rw_open"]
-                and col["usage_page"] == TARGET_USAGE_PAGE
-                and col["usage"] == TARGET_USAGE
+        """Opens specifically the LCD display collection (UsagePage=0xFF01, Usage=0x0001) and retains the handle."""
+        self.close()
+        hid_guid = GUID()
+        hid_dll.HidD_GetHidGuid(ctypes.byref(hid_guid))
+        h_dev_info = setupapi.SetupDiGetClassDevsA(
+            ctypes.byref(hid_guid), None, None, 0x02 | 0x10
+        )
+
+        idx = 0
+        found = False
+        while True:
+            iface_data = SP_DEVICE_INTERFACE_DATA()
+            iface_data.cbSize = ctypes.sizeof(SP_DEVICE_INTERFACE_DATA)
+            if not setupapi.SetupDiEnumDeviceInterfaces(
+                h_dev_info, None, ctypes.byref(hid_guid), idx, ctypes.byref(iface_data)
             ):
-                h_file = kernel32.CreateFileA(
-                    col["path"].encode(),
-                    0x80000000 | 0x40000000,
-                    0x03,
-                    None,
-                    3,
-                    0,
-                    None,
-                )
-                if h_file != ctypes.c_void_p(-1).value and h_file:
-                    self.handle = h_file
-                    self.device_path = col["path"]
-                    return True
-        return False
+                break
+            idx += 1
+
+            req_size = wintypes.DWORD(0)
+            setupapi.SetupDiGetDeviceInterfaceDetailA(
+                h_dev_info, ctypes.byref(iface_data), None, 0, ctypes.byref(req_size), None
+            )
+            buf = ctypes.create_string_buffer(req_size.value)
+            cb_size = 8 if ctypes.sizeof(ctypes.c_void_p) == 8 else 5
+            ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0] = cb_size
+
+            if setupapi.SetupDiGetDeviceInterfaceDetailA(
+                h_dev_info, ctypes.byref(iface_data), buf, req_size, None, None
+            ):
+                path = ctypes.string_at(ctypes.addressof(buf) + 4)
+                path_lower = path.lower()
+                # Skip keyboard collections (\kbd) and non-Ocypus devices immediately without touching their handles
+                if f"vid_{VID:04x}&pid_{PID:04x}".encode() in path_lower and not path_lower.endswith(b"\\kbd"):
+                    h_file = kernel32.CreateFileA(
+                        path, 0x80000000 | 0x40000000, 0x03, None, 3, 0, None
+                    )
+                    if not h_file or h_file == ctypes.c_void_p(-1).value:
+                        continue
+
+                    preparsed = ctypes.c_void_p()
+                    caps = HIDP_CAPS()
+                    matched = False
+                    if hid_dll.HidD_GetPreparsedData(h_file, ctypes.byref(preparsed)):
+                        hid_dll.HidP_GetCaps(preparsed, ctypes.byref(caps))
+                        hid_dll.HidD_FreePreparsedData(preparsed)
+                        if (
+                            caps.UsagePage == TARGET_USAGE_PAGE
+                            and caps.Usage == TARGET_USAGE
+                        ):
+                            matched = True
+
+                    if matched:
+                        self.handle = h_file
+                        self.device_path = path.decode(errors="ignore")
+                        found = True
+                        break
+                    else:
+                        kernel32.CloseHandle(h_file)
+
+        setupapi.SetupDiDestroyDeviceInfoList(h_dev_info)
+        return found
 
     def close(self):
         """Closes the device handle."""
@@ -238,7 +279,8 @@ class OcypusController:
     ) -> bool:
         """Sends a 65-byte Feature Report to update temperature digits on the display."""
         if not self.handle:
-            return False
+            if not self.open():
+                return False
 
         is_fahrenheit = unit.lower() == "f"
         if is_fahrenheit:
@@ -425,7 +467,67 @@ def select_sensor(
     return first_key, sensors[first_key]
 
 
-def run_loop(controller: OcypusController, sensor_kw: str, unit: str, rate: float):
+def disable_usb_selective_suspend():
+    """Disables Windows USB Selective Suspend in the active power plan to prevent cooler port stalls."""
+    sub_usb = "2a737441-1930-4402-8d77-b2bebba308a3"
+    usb_suspend = "48e6b7a6-50f5-4782-a5d4-53bb8f07e226"
+    try:
+        subprocess.run(
+            ["powercfg", "/setacvalueindex", "SCHEME_CURRENT", sub_usb, usb_suspend, "0"],
+            capture_output=True,
+        )
+        subprocess.run(
+            ["powercfg", "/setdcvalueindex", "SCHEME_CURRENT", sub_usb, usb_suspend, "0"],
+            capture_output=True,
+        )
+        subprocess.run(["powercfg", "/setactive", "SCHEME_CURRENT"], capture_output=True)
+    except Exception:
+        pass
+
+
+def reset_usb_device():
+    """Resets the Ocypus USB composite device via PnPUtil (prompts for Admin UAC if needed) to clear Endpoint 0 stalls."""
+    disable_usb_selective_suspend()
+    print("[*] Resetting Ocypus USB device (VID_1A2C & PID_434D)...")
+    ps_script = (
+        "$devs = Get-PnpDevice | Where-Object { $_.InstanceId -match 'USB\\\\VID_1A2C&PID_434D' }; "
+        "foreach ($d in $devs) { pnputil /restart-device $d.InstanceId }"
+    )
+    is_admin = False
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        pass
+
+    if is_admin:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps_script])
+    else:
+        print("    Requesting Administrator permission (UAC) to restart the USB port...")
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                f"Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile -Command \"{ps_script}\"'",
+            ]
+        )
+    time.sleep(2.0)
+    print("[+] USB device reset complete.")
+
+
+def run_loop(
+    controller: OcypusController,
+    sensor_kw: str,
+    unit: str,
+    rate: float,
+    delay: float = 0.0,
+):
+    existing_pid = get_running_driver_pid()
+    if existing_pid and existing_pid != os.getpid():
+        if sys.stdout and sys.stdout.isatty():
+            print(f"[!] Another driver instance is already running (PID: {existing_pid}).")
+        return
+
     # Save current process PID
     try:
         with open(PID_FILE, "w") as f:
@@ -433,6 +535,13 @@ def run_loop(controller: OcypusController, sensor_kw: str, unit: str, rate: floa
     except Exception:
         pass
 
+    if delay > 0:
+        time.sleep(delay)
+
+    if not controller.handle:
+        controller.open()
+
+    consecutive_failures = 0
     try:
         while True:
             sensors = get_all_temperatures()
@@ -440,22 +549,38 @@ def run_loop(controller: OcypusController, sensor_kw: str, unit: str, rate: floa
 
             if chosen:
                 name, temp_c = chosen
-                controller.send_temperature(temp_c, unit=unit, led_on=True)
-                if sys.stdout and sys.stdout.isatty():
-                    disp = temp_c if unit.lower() == "c" else (temp_c * 9.0 / 5.0 + 32.0)
-                    sym = "°C" if unit.lower() == "c" else "°F"
-                    print(
-                        f"\r[OK] Sensor: {name} | Screen: {int(round(disp))}{sym} ({temp_c:.1f}°C)      ",
-                        end="",
-                        flush=True,
-                    )
+                ok = controller.send_temperature(temp_c, unit=unit, led_on=True)
+                if not ok:
+                    consecutive_failures += 1
+                    err = kernel32.GetLastError()
+                    controller.close()
+                    time.sleep(1.0)
+                    controller.open()
+                    if sys.stdout and sys.stdout.isatty():
+                        print(
+                            f"\r[ERR] USB transfer failed (Win32 Error {err}). Reconnecting... (try 'reset-usb' if stuck)   ",
+                            end="",
+                            flush=True,
+                        )
+                else:
+                    consecutive_failures = 0
+                    if sys.stdout and sys.stdout.isatty():
+                        disp = temp_c if unit.lower() == "c" else (temp_c * 9.0 / 5.0 + 32.0)
+                        sym = "°C" if unit.lower() == "c" else "°F"
+                        print(
+                            f"\r[OK] Sensor: {name} | Screen: {int(round(disp))}{sym} ({temp_c:.1f}°C)      ",
+                            end="",
+                            flush=True,
+                        )
             time.sleep(rate)
     except KeyboardInterrupt:
         pass
     finally:
         if os.path.exists(PID_FILE):
             try:
-                os.remove(PID_FILE)
+                with open(PID_FILE, "r") as f:
+                    if int(f.read().strip()) == os.getpid():
+                        os.remove(PID_FILE)
             except Exception:
                 pass
 
@@ -490,6 +615,8 @@ def start_background(unit: str, sensor: str, rate: float):
     if existing_pid:
         print(f"[!] Driver is already running in background (PID: {existing_pid}).")
         return
+
+    disable_usb_selective_suspend()
 
     pythonw_exe = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw_exe):
@@ -549,45 +676,63 @@ def status_background():
 
 
 def install_startup(unit: str, sensor: str, rate: float):
-    """Configures the driver to run silently upon Windows login via Task Scheduler."""
+    """Configures the driver to run silently upon Windows login."""
+    import winreg
+
+    disable_usb_selective_suspend()
+
     script_path = os.path.abspath(__file__)
     pythonw_exe = sys.executable.replace("python.exe", "pythonw.exe")
     if not os.path.exists(pythonw_exe):
         pythonw_exe = sys.executable
 
-    action_cmd = f'"{pythonw_exe}" "{script_path}" on -u {unit} -s "{sensor}" -r {rate}'
-
-    cmd = [
-        "schtasks",
-        "/Create",
-        "/TN",
-        TASK_NAME,
-        "/TR",
-        action_cmd,
-        "/SC",
-        "ONLOGON",
-        "/F",
-    ]
+    # Use a 10-second delay at login so USB enumeration and Core Temp settle first
+    action_cmd = f'"{pythonw_exe}" "{script_path}" on -u {unit} -s "{sensor}" -r {rate} --delay 10'
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"[+] Automatic startup configured successfully!")
-        print(f"    Task '{TASK_NAME}' registered in Windows Task Scheduler.")
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, TASK_NAME, 0, winreg.REG_SZ, action_cmd)
+
+        # Also update Task Scheduler if running with permission, or ignore if non-admin
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", TASK_NAME, "/TR", action_cmd, "/SC", "ONLOGON", "/F"],
+            capture_output=True,
+        )
+
+        print("[+] Automatic startup configured successfully!")
+        print("    • Windows USB Selective Suspend disabled for stability.")
+        print(f"    • Startup entry '{TASK_NAME}' registered in HKCU\\...\\Run (with 10s boot delay).")
         print("    The driver will launch silently every time you log in to Windows.")
-        print(f"\n    To start it right now: python ocypus_driver.py start")
-        print(f"    To remove from startup: python ocypus_driver.py uninstall-startup")
-    except subprocess.CalledProcessError as e:
-        print(f"[-] Error registering task: {e.stderr}")
+        print("\n    To start it right now: python ocypus_driver.py start")
+        print("    To remove from startup: python ocypus_driver.py uninstall-startup")
+    except Exception as e:
+        print(f"[-] Error registering startup: {e}")
 
 
 def uninstall_startup():
-    """Removes the scheduled startup task."""
-    cmd = ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"]
+    """Removes the startup entry from Registry and Task Scheduler."""
+    import winreg
+
+    removed = False
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print(f"[+] Automatic startup removed (Task '{TASK_NAME}' deleted).")
-    except subprocess.CalledProcessError as e:
-        print(f"[-] Error removing task: {e.stderr}")
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, TASK_NAME)
+            removed = True
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    res = subprocess.run(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"], capture_output=True)
+    if res.returncode == 0:
+        removed = True
+
+    if removed:
+        print(f"[+] Automatic startup removed ('{TASK_NAME}').")
+    else:
+        print(f"[*] No startup entry found for '{TASK_NAME}'.")
 
 
 def main():
@@ -601,6 +746,7 @@ def main():
           python ocypus_driver.py status             # Check if background driver is active
           python ocypus_driver.py install-startup    # Enable auto-start on Windows login
           python ocypus_driver.py uninstall-startup  # Disable auto-start
+          python ocypus_driver.py reset-usb          # Reset USB port if display hangs (Error 31)
           python ocypus_driver.py list               # List active sensors and HID collections
           python ocypus_driver.py on                 # Run in foreground (prints to terminal)
           python ocypus_driver.py off                # Blank the cooler display
@@ -629,6 +775,9 @@ def main():
 
     subparsers.add_parser("uninstall-startup", help="Remove from Windows startup")
 
+    # Reset USB
+    subparsers.add_parser("reset-usb", help="Reset Ocypus USB port if hardware endpoint hangs")
+
     # List
     subparsers.add_parser("list", help="List cooler interfaces and active sensors")
 
@@ -637,9 +786,15 @@ def main():
     on_parser.add_argument("-u", "--unit", choices=["c", "f"], default="c")
     on_parser.add_argument("-s", "--sensor", default="auto")
     on_parser.add_argument("-r", "--rate", type=float, default=1.0)
+    on_parser.add_argument("--delay", type=float, default=0.0, help="Initial delay in seconds before opening device")
 
     # Off
     subparsers.add_parser("off", help="Blank the cooler display")
+
+    # Test
+    test_parser = subparsers.add_parser("test", help="Send a fixed test temperature to the display")
+    test_parser.add_argument("-t", "--temp", type=int, default=88, help="Temperature value to display (default: 88)")
+    test_parser.add_argument("-u", "--unit", choices=["c", "f"], default="c")
 
     args = parser.parse_args()
     if not args.command:
@@ -660,6 +815,9 @@ def main():
 
     elif args.command == "uninstall-startup":
         uninstall_startup()
+
+    elif args.command == "reset-usb":
+        reset_usb_device()
 
     elif args.command == "list":
         cols = OcypusController.list_collections()
@@ -685,11 +843,11 @@ def main():
             print("  -> Ensure Core Temp (with 'Enable shared memory') or HWiNFO is running.")
 
     elif args.command == "on":
-        with OcypusController() as ctrl:
-            if not ctrl.handle:
-                print("[-] Error: Ocypus cooler display panel not found.")
-                return
-            run_loop(ctrl, args.sensor, args.unit, args.rate)
+        ctrl = OcypusController()
+        try:
+            run_loop(ctrl, args.sensor, args.unit, args.rate, delay=args.delay)
+        finally:
+            ctrl.close()
 
     elif args.command == "off":
         with OcypusController() as ctrl:
@@ -697,6 +855,20 @@ def main():
                 print("[+] Display turned off successfully.")
             else:
                 print("[-] Failed to turn off display.")
+
+    elif args.command == "test":
+        with OcypusController() as ctrl:
+            if not ctrl.handle:
+                print("[-] Ocypus cooler display panel not found.")
+                return
+            ok = ctrl.send_temperature(args.temp, unit=args.unit, led_on=True)
+            if ok:
+                print(f"[+] Sent test temperature {args.temp}°{args.unit.upper()} to display successfully!")
+            else:
+                err = kernel32.GetLastError()
+                print(f"[-] Failed to send test packet (Win32 Error {err}).")
+                if err == 31:
+                    print("    -> Hardware USB endpoint stalled. Run: python ocypus_driver.py reset-usb")
 
 
 if __name__ == "__main__":
