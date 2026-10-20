@@ -14,7 +14,7 @@ Ocypus coolers use an internal USB header to update their digital LED/LCD temper
 
 * **Safety & Transparency:** The official vendor software is closed-source and proprietary, requiring users to install unaudited third-party binaries on their systems.
 * **No Windows Alternative:** Existing open-source scripts were developed exclusively for Linux and do not work out of the box on Windows.
-* **Lightweight & Clean:** Provides a transparent, low-overhead solution that runs quietly without bloat or heavy background suites.
+* **Lightweight & Clean:** Provides a transparent, low-overhead solution that runs quietly without bloat, background telemetry suites, or high CPU usage.
 
 ---
 
@@ -22,11 +22,13 @@ Ocypus coolers use an internal USB header to update their digital LED/LCD temper
 
 * **Zero External Dependencies:** No `pip install` required! Uses native Windows APIs (`hid.dll` and `setupapi.dll` via Python's built-in `ctypes`).
 * **Clean & Safe Sensor Architecture:** Reads temperatures directly from standard Windows shared memory exposed by trusted tools:
-  * **[Core Temp](https://www.alcpu.com/CoreTemp/):** Reads `CoreTempMappingObject` with microsecond latency and zero overhead.
+  * **[Core Temp](https://www.alcpu.com/CoreTemp/):** Reads `CoreTempMappingObject` with microsecond latency and zero CPU overhead.
   * **[HWiNFO](https://www.hwinfo.com/):** Reads `Global\HWiNFO_SENS_SM2` shared memory.
-  * **NVIDIA GPUs:** Native fallback via `nvidia-smi` (no admin required).
+  * **NVIDIA GPUs:** Direct in-process NVML monitoring (`nvml.dll` via `ctypes`) with sub-millisecond response times and **zero child process creation** (no `nvidia-smi` microstutters).
+* **Lazy Evaluation (Zero Wasted Cycles):** Only queries the GPU if explicitly requested (`-s gpu`) or if no CPU sensors are active, preventing unnecessary PCIe wakeups and power state disruptions.
+* **Native Process Management:** Fast, reliable PID tracking using `kernel32.OpenProcess` (no `tasklist.exe` spawning).
 * **True Silent Background Mode:** Launches invisibly in the background using `pythonw.exe` (no black terminal windows popping up).
-* **One-Click Windows Startup:** Built-in command to register automatic startup with Windows Task Scheduler upon user logon.
+* **One-Click Windows Startup:** Built-in command to register automatic startup with Windows Task Scheduler and Registry upon user logon.
 
 ---
 

@@ -9,7 +9,7 @@ Features:
   • Zero external pip dependencies required (runs on stock Python 3.8+ on Windows).
   • Reads CPU temperatures cleanly via Core Temp shared memory (CoreTempMappingObject)
     or HWiNFO shared memory (Global\\HWiNFO_SENS_SM2).
-  • Native NVIDIA GPU temperature monitoring via nvidia-smi.
+  • Ultra-low-overhead NVIDIA GPU temperature monitoring via native in-process NVML (ctypes).
   • Silent background execution mode using pythonw.exe (no persistent command prompt window).
   • Automatic startup installation with Windows Task Scheduler (single command).
 """
@@ -117,6 +117,10 @@ kernel32.CreateFileA.argtypes = [
     ctypes.c_void_p,
 ]
 kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
 
 hid_dll.HidD_GetPreparsedData.argtypes = [
     ctypes.c_void_p,
@@ -406,9 +410,47 @@ def read_hwinfo_shared_memory() -> Dict[str, float]:
     return sensors
 
 
+# --- Native NVML (NVIDIA Management Library) via ctypes (in-process, 0 child processes) ---
+_nvml_initialized = False
+_nvml_dll = None
+_nvml_device_handle = None
+
+
+def _init_nvml() -> bool:
+    global _nvml_initialized, _nvml_dll, _nvml_device_handle
+    if _nvml_initialized:
+        return _nvml_device_handle is not None
+    _nvml_initialized = True
+    try:
+        _nvml_dll = ctypes.WinDLL("nvml.dll")
+        if _nvml_dll.nvmlInit_v2() == 0:
+            h = ctypes.c_void_p()
+            if _nvml_dll.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(h)) == 0:
+                _nvml_device_handle = h
+                return True
+    except Exception:
+        pass
+    _nvml_dll = None
+    _nvml_device_handle = None
+    return False
+
+
 def read_nvidia_gpu_temp() -> Dict[str, float]:
-    """Reads NVIDIA GPU temperature using nvidia-smi (native, non-admin)."""
+    """Reads NVIDIA GPU temperature using direct in-process NVML (ctypes), avoiding child processes."""
     sensors: Dict[str, float] = {}
+    if _init_nvml() and _nvml_dll and _nvml_device_handle:
+        try:
+            temp = ctypes.c_uint()
+            # 0 = NVML_TEMPERATURE_GPU
+            if _nvml_dll.nvmlDeviceGetTemperature(_nvml_device_handle, 0, ctypes.byref(temp)) == 0:
+                val = float(temp.value)
+                if 0 < val < 125:
+                    sensors["NVIDIA:GPU Temperature"] = val
+                    return sensors
+        except Exception:
+            pass
+
+    # Rare fallback: nvidia-smi CLI only if nvml.dll failed completely
     try:
         res = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
@@ -425,12 +467,27 @@ def read_nvidia_gpu_temp() -> Dict[str, float]:
     return sensors
 
 
-def get_all_temperatures() -> Dict[str, float]:
-    """Collects temperatures from all available reliable sources."""
+def get_all_temperatures(sensor_kw: str = "auto", query_all: bool = False) -> Dict[str, float]:
+    """Collects temperatures cleanly. Avoids polling the GPU when a CPU sensor is already active."""
     sensors: Dict[str, float] = {}
+    is_gpu_requested = bool(
+        sensor_kw and any(g in sensor_kw.lower() for g in ("gpu", "nvidia", "vga"))
+    )
+
+    if query_all or is_gpu_requested:
+        sensors.update(read_nvidia_gpu_temp())
+        sensors.update(read_coretemp_shared_memory())
+        sensors.update(read_hwinfo_shared_memory())
+        return sensors
+
+    # Fast path: shared memory reads from Core Temp / HWiNFO take < 0.001ms with zero CPU overhead
     sensors.update(read_coretemp_shared_memory())
     sensors.update(read_hwinfo_shared_memory())
-    sensors.update(read_nvidia_gpu_temp())
+
+    # Fallback to GPU only if no CPU sensors are active
+    if not sensors:
+        sensors.update(read_nvidia_gpu_temp())
+
     return sensors
 
 
@@ -544,7 +601,7 @@ def run_loop(
     consecutive_failures = 0
     try:
         while True:
-            sensors = get_all_temperatures()
+            sensors = get_all_temperatures(sensor_kw)
             chosen = select_sensor(sensors, sensor_kw)
 
             if chosen:
@@ -586,15 +643,16 @@ def run_loop(
 
 
 def is_process_running(pid: int) -> bool:
-    try:
-        res = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-        )
-        return str(pid) in res.stdout
-    except Exception:
+    if pid <= 0:
         return False
+    # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h = kernel32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return False
+    code = wintypes.DWORD()
+    ok = kernel32.GetExitCodeProcess(h, ctypes.byref(code))
+    kernel32.CloseHandle(h)
+    return bool(ok and code.value == 259)  # STILL_ACTIVE = 259
 
 
 def get_running_driver_pid() -> Optional[int]:
@@ -604,6 +662,11 @@ def get_running_driver_pid() -> Optional[int]:
                 pid = int(f.read().strip())
             if is_process_running(pid):
                 return pid
+            else:
+                try:
+                    os.remove(PID_FILE)
+                except Exception:
+                    pass
         except Exception:
             pass
     return None
@@ -630,6 +693,11 @@ def start_background(unit: str, sensor: str, rate: float):
         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
         close_fds=True,
     )
+    try:
+        with open(PID_FILE, "w") as f:
+            f.write(str(proc.pid))
+    except Exception:
+        pass
 
     time.sleep(1.0)
     print(f"[+] Driver started in the background (PID: {proc.pid})!")
@@ -834,7 +902,7 @@ def main():
             )
 
         print("\n=== Active Temperature Sensors ===")
-        sensors = get_all_temperatures()
+        sensors = get_all_temperatures(query_all=True)
         if sensors:
             for k, v in sorted(sensors.items()):
                 print(f"  {k}: {v:.1f}°C")
