@@ -138,8 +138,6 @@ class OcypusController:
     def __init__(self):
         self.handle: Optional[int] = None
         self.device_path: Optional[str] = None
-        self._last_state: Optional[Tuple[int, bool, bool]] = None
-        self._last_send_time: float = 0.0
 
     def __enter__(self):
         self.open()
@@ -279,15 +277,12 @@ class OcypusController:
             kernel32.CloseHandle(self.handle)
             self.handle = None
             self.device_path = None
-        self._last_state = None
-        self._last_send_time = 0.0
 
     def send_temperature(
         self,
         temp_celsius: float,
         unit: str = "c",
         led_on: bool = True,
-        force: bool = False,
     ) -> bool:
         """Sends a 65-byte Feature Report to update temperature digits on the display."""
         if not self.handle:
@@ -301,16 +296,6 @@ class OcypusController:
             display_temp = int(round(temp_celsius))
 
         display_temp = max(0, min(199, display_temp))
-        current_state = (display_temp, is_fahrenheit, led_on)
-        now = time.monotonic()
-
-        # Skip redundant USB transfers if state hasn't changed, but refresh every 10 seconds (keep-alive)
-        if (
-            not force
-            and self._last_state == current_state
-            and (now - self._last_send_time) < 10.0
-        ):
-            return True
 
         buf = (ctypes.c_ubyte * 65)()
         buf[0] = REPORT_ID
@@ -327,16 +312,11 @@ class OcypusController:
             buf[5] = 0x00
 
         ok = hid_dll.HidD_SetFeature(self.handle, ctypes.byref(buf), 65)
-        if ok:
-            self._last_state = current_state
-            self._last_send_time = now
-        else:
-            self._last_state = None
         return bool(ok)
 
     def blank_display(self) -> bool:
         """Blanks the LCD screen."""
-        return self.send_temperature(0, unit="c", led_on=False, force=True)
+        return self.send_temperature(0, unit="c", led_on=False)
 
 
 # --- Core Temp Shared Memory Structures (CoreTempMappingObject) ---
@@ -614,7 +594,7 @@ def run_loop(
     controller: OcypusController,
     sensor_kw: str,
     unit: str,
-    rate: float,
+    rate: float = 2.0,
     delay: float = 0.0,
 ):
     existing_pid = get_running_driver_pid()
@@ -712,7 +692,7 @@ def get_running_driver_pid() -> Optional[int]:
     return None
 
 
-def start_background(unit: str, sensor: str, rate: float):
+def start_background(unit: str, sensor: str, rate: float = 2.0):
     """Starts the driver silently in the background using pythonw.exe."""
     existing_pid = get_running_driver_pid()
     if existing_pid:
@@ -799,7 +779,7 @@ def status_background():
         print("[-] Driver is STOPPED (no background process detected).")
 
 
-def install_startup(unit: str, sensor: str, rate: float):
+def install_startup(unit: str, sensor: str, rate: float = 2.0):
     """Configures the driver to run silently upon Windows login."""
     import winreg
 
@@ -883,7 +863,7 @@ def main():
     start_parser = subparsers.add_parser("start", help="Start the driver silently in background")
     start_parser.add_argument("-u", "--unit", choices=["c", "f"], default="c")
     start_parser.add_argument("-s", "--sensor", default="auto")
-    start_parser.add_argument("-r", "--rate", type=float, default=1.0)
+    start_parser.add_argument("-r", "--rate", type=float, default=2.0)
 
     # Stop background
     subparsers.add_parser("stop", help="Stop background driver and blank display")
@@ -895,7 +875,7 @@ def main():
     inst_parser = subparsers.add_parser("install-startup", help="Configure auto-start on Windows login")
     inst_parser.add_argument("-u", "--unit", choices=["c", "f"], default="c")
     inst_parser.add_argument("-s", "--sensor", default="auto")
-    inst_parser.add_argument("-r", "--rate", type=float, default=1.0)
+    inst_parser.add_argument("-r", "--rate", type=float, default=2.0)
 
     subparsers.add_parser("uninstall-startup", help="Remove from Windows startup")
 
@@ -909,7 +889,7 @@ def main():
     on_parser = subparsers.add_parser("on", help="Run in foreground (display readings in terminal)")
     on_parser.add_argument("-u", "--unit", choices=["c", "f"], default="c")
     on_parser.add_argument("-s", "--sensor", default="auto")
-    on_parser.add_argument("-r", "--rate", type=float, default=1.0)
+    on_parser.add_argument("-r", "--rate", type=float, default=2.0)
     on_parser.add_argument("--delay", type=float, default=0.0, help="Initial delay in seconds before opening device")
 
     # Off
@@ -985,7 +965,7 @@ def main():
             if not ctrl.handle:
                 print("[-] Ocypus cooler display panel not found.")
                 return
-            ok = ctrl.send_temperature(args.temp, unit=args.unit, led_on=True, force=True)
+            ok = ctrl.send_temperature(args.temp, unit=args.unit, led_on=True)
             if ok:
                 print(f"[+] Sent test temperature {args.temp}°{args.unit.upper()} to display successfully!")
             else:
