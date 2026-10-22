@@ -138,6 +138,8 @@ class OcypusController:
     def __init__(self):
         self.handle: Optional[int] = None
         self.device_path: Optional[str] = None
+        self._last_state: Optional[Tuple[int, bool, bool]] = None
+        self._last_send_time: float = 0.0
 
     def __enter__(self):
         self.open()
@@ -277,9 +279,15 @@ class OcypusController:
             kernel32.CloseHandle(self.handle)
             self.handle = None
             self.device_path = None
+        self._last_state = None
+        self._last_send_time = 0.0
 
     def send_temperature(
-        self, temp_celsius: float, unit: str = "c", led_on: bool = True
+        self,
+        temp_celsius: float,
+        unit: str = "c",
+        led_on: bool = True,
+        force: bool = False,
     ) -> bool:
         """Sends a 65-byte Feature Report to update temperature digits on the display."""
         if not self.handle:
@@ -293,6 +301,16 @@ class OcypusController:
             display_temp = int(round(temp_celsius))
 
         display_temp = max(0, min(199, display_temp))
+        current_state = (display_temp, is_fahrenheit, led_on)
+        now = time.monotonic()
+
+        # Skip redundant USB transfers if state hasn't changed, but refresh every 10 seconds (keep-alive)
+        if (
+            not force
+            and self._last_state == current_state
+            and (now - self._last_send_time) < 10.0
+        ):
+            return True
 
         buf = (ctypes.c_ubyte * 65)()
         buf[0] = REPORT_ID
@@ -309,13 +327,16 @@ class OcypusController:
             buf[5] = 0x00
 
         ok = hid_dll.HidD_SetFeature(self.handle, ctypes.byref(buf), 65)
-        if not ok:
-            ok = hid_dll.HidD_SetFeature(self.handle, ctypes.byref(buf), 64)
+        if ok:
+            self._last_state = current_state
+            self._last_send_time = now
+        else:
+            self._last_state = None
         return bool(ok)
 
     def blank_display(self) -> bool:
         """Blanks the LCD screen."""
-        return self.send_temperature(0, unit="c", led_on=False)
+        return self.send_temperature(0, unit="c", led_on=False, force=True)
 
 
 # --- Core Temp Shared Memory Structures (CoreTempMappingObject) ---
@@ -414,6 +435,7 @@ def read_hwinfo_shared_memory() -> Dict[str, float]:
 _nvml_initialized = False
 _nvml_dll = None
 _nvml_device_handle = None
+_nvidia_smi_available: Optional[bool] = None
 
 
 def _init_nvml() -> bool:
@@ -437,6 +459,7 @@ def _init_nvml() -> bool:
 
 def read_nvidia_gpu_temp() -> Dict[str, float]:
     """Reads NVIDIA GPU temperature using direct in-process NVML (ctypes), avoiding child processes."""
+    global _nvidia_smi_available
     sensors: Dict[str, float] = {}
     if _init_nvml() and _nvml_dll and _nvml_device_handle:
         try:
@@ -450,7 +473,10 @@ def read_nvidia_gpu_temp() -> Dict[str, float]:
         except Exception:
             pass
 
-    # Rare fallback: nvidia-smi CLI only if nvml.dll failed completely
+    # Rare fallback: nvidia-smi CLI only if nvml.dll failed and CLI hasn't failed previously
+    if _nvidia_smi_available is False:
+        return sensors
+
     try:
         res = subprocess.run(
             ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader"],
@@ -462,17 +488,20 @@ def read_nvidia_gpu_temp() -> Dict[str, float]:
         if res.returncode == 0 and res.stdout.strip():
             val = float(res.stdout.strip().splitlines()[0])
             sensors["NVIDIA:GPU Temperature"] = val
+            _nvidia_smi_available = True
+        else:
+            _nvidia_smi_available = False
     except Exception:
-        pass
+        _nvidia_smi_available = False
     return sensors
 
 
 def get_all_temperatures(sensor_kw: str = "auto", query_all: bool = False) -> Dict[str, float]:
-    """Collects temperatures cleanly. Avoids polling the GPU when a CPU sensor is already active."""
+    """Collects temperatures cleanly. Avoids polling unnecessary sensors when a CPU sensor is already active."""
     sensors: Dict[str, float] = {}
-    is_gpu_requested = bool(
-        sensor_kw and any(g in sensor_kw.lower() for g in ("gpu", "nvidia", "vga"))
-    )
+    kw_lower = (sensor_kw or "").lower()
+    is_gpu_requested = any(g in kw_lower for g in ("gpu", "nvidia", "vga"))
+    is_hwinfo_requested = "hwinfo" in kw_lower
 
     if query_all or is_gpu_requested:
         sensors.update(read_nvidia_gpu_temp())
@@ -480,14 +509,23 @@ def get_all_temperatures(sensor_kw: str = "auto", query_all: bool = False) -> Di
         sensors.update(read_hwinfo_shared_memory())
         return sensors
 
-    # Fast path: shared memory reads from Core Temp / HWiNFO take < 0.001ms with zero CPU overhead
+    if query_all or is_hwinfo_requested:
+        sensors.update(read_hwinfo_shared_memory())
+        sensors.update(read_coretemp_shared_memory())
+        return sensors
+
+    # Fast path: Check Core Temp first (< 0.001ms)
     sensors.update(read_coretemp_shared_memory())
+    if sensors:
+        return sensors
+
+    # Fallback to HWiNFO only if Core Temp didn't have data
     sensors.update(read_hwinfo_shared_memory())
+    if sensors:
+        return sensors
 
     # Fallback to GPU only if no CPU sensors are active
-    if not sensors:
-        sensors.update(read_nvidia_gpu_temp())
-
+    sensors.update(read_nvidia_gpu_temp())
     return sensors
 
 
@@ -601,34 +639,36 @@ def run_loop(
     consecutive_failures = 0
     try:
         while True:
-            sensors = get_all_temperatures(sensor_kw)
-            chosen = select_sensor(sensors, sensor_kw)
+            try:
+                sensors = get_all_temperatures(sensor_kw)
+                chosen = select_sensor(sensors, sensor_kw)
 
-            if chosen:
-                name, temp_c = chosen
-                ok = controller.send_temperature(temp_c, unit=unit, led_on=True)
-                if not ok:
-                    consecutive_failures += 1
-                    err = kernel32.GetLastError()
-                    controller.close()
-                    time.sleep(1.0)
-                    controller.open()
-                    if sys.stdout and sys.stdout.isatty():
-                        print(
-                            f"\r[ERR] USB transfer failed (Win32 Error {err}). Reconnecting... (try 'reset-usb' if stuck)   ",
-                            end="",
-                            flush=True,
-                        )
-                else:
-                    consecutive_failures = 0
-                    if sys.stdout and sys.stdout.isatty():
-                        disp = temp_c if unit.lower() == "c" else (temp_c * 9.0 / 5.0 + 32.0)
-                        sym = "°C" if unit.lower() == "c" else "°F"
-                        print(
-                            f"\r[OK] Sensor: {name} | Screen: {int(round(disp))}{sym} ({temp_c:.1f}°C)      ",
-                            end="",
-                            flush=True,
-                        )
+                if chosen:
+                    name, temp_c = chosen
+                    ok = controller.send_temperature(temp_c, unit=unit, led_on=True)
+                    if not ok:
+                        consecutive_failures += 1
+                        err = kernel32.GetLastError()
+                        controller.close()
+                        if sys.stdout and sys.stdout.isatty():
+                            print(
+                                f"\r[ERR] USB transfer failed (Win32 Error {err}). Reconnecting... (try 'reset-usb' if stuck)   ",
+                                end="",
+                                flush=True,
+                            )
+                        time.sleep(1.0)
+                    else:
+                        consecutive_failures = 0
+                        if sys.stdout and sys.stdout.isatty():
+                            disp = temp_c if unit.lower() == "c" else (temp_c * 9.0 / 5.0 + 32.0)
+                            sym = "°C" if unit.lower() == "c" else "°F"
+                            print(
+                                f"\r[OK] Sensor: {name} | Screen: {int(round(disp))}{sym} ({temp_c:.1f}°C)      ",
+                                end="",
+                                flush=True,
+                            )
+            except Exception:
+                pass
             time.sleep(rate)
     except KeyboardInterrupt:
         pass
@@ -688,11 +728,27 @@ def start_background(unit: str, sensor: str, rate: float):
     script_path = os.path.abspath(__file__)
     cmd = [pythonw_exe, script_path, "on", "-u", unit, "-s", sensor, "-r", str(rate)]
 
-    proc = subprocess.Popen(
-        cmd,
-        creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-        close_fds=True,
+    # 0x01000000 = CREATE_BREAKAWAY_FROM_JOB (allows background process to survive parent terminal closing)
+    creation_flags = (
+        subprocess.DETACHED_PROCESS
+        | subprocess.CREATE_NEW_PROCESS_GROUP
+        | 0x01000000
     )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=SCRIPT_DIR,
+            creationflags=creation_flags,
+            close_fds=True,
+        )
+    except OSError:
+        # Fallback if job breakaway is disallowed by Windows security policy
+        proc = subprocess.Popen(
+            cmd,
+            cwd=SCRIPT_DIR,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+            close_fds=True,
+        )
     try:
         with open(PID_FILE, "w") as f:
             f.write(str(proc.pid))
@@ -929,7 +985,7 @@ def main():
             if not ctrl.handle:
                 print("[-] Ocypus cooler display panel not found.")
                 return
-            ok = ctrl.send_temperature(args.temp, unit=args.unit, led_on=True)
+            ok = ctrl.send_temperature(args.temp, unit=args.unit, led_on=True, force=True)
             if ok:
                 print(f"[+] Sent test temperature {args.temp}°{args.unit.upper()} to display successfully!")
             else:

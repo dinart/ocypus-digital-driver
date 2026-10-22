@@ -6,6 +6,7 @@ __pycache__/
 # Ocypus Driver runtime files
 *.pid
 ocypus_driver.pid
+*.log
 
 # OS generated files
 Thumbs.db
